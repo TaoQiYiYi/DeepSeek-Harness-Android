@@ -37,7 +37,11 @@ public class ShareProvider extends ContentProvider {
     }
 
     @Override
-    public String getType(Uri uri) { return "text/plain"; }
+    public String getType(Uri uri) {
+        String name = uri == null ? null : uri.getLastPathSegment();
+        if (name != null && name.toLowerCase().endsWith(".apk")) return "application/vnd.android.package-archive";
+        return "text/plain";
+    }
 
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) { return null; }

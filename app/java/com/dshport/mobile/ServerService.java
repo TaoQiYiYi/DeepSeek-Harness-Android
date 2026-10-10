@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Environment;
 import android.os.IBinder;
 
 import java.io.BufferedReader;
@@ -141,6 +142,18 @@ public class ServerService extends Service {
             if (!dshHome.mkdirs() && !dshHome.isDirectory()) Runtime.log(ctx, "warn: dsh home mkdir failed");
             if (!Runtime.tmpDir(ctx).mkdirs() && !Runtime.tmpDir(ctx).isDirectory()) Runtime.log(ctx, "warn: tmp mkdir failed");
 
+            File tlsDir = new File(rt, "etc/tls");
+            File sslConf = new File(tlsDir, "openssl.cnf");
+            try {
+                if (!tlsDir.mkdirs() && !tlsDir.isDirectory()) Runtime.log(ctx, "warn: tls dir mkdir failed");
+                FileWriter cw = new FileWriter(sslConf);
+                cw.write("# DSHPort minimal OpenSSL configuration\n# bypasses the Termux-embedded config path of the bundled Node runtime\n");
+                cw.close();
+            } catch (Throwable t) {
+                Runtime.log(ctx, "warn: openssl conf write failed: " + t);
+            }
+            Runtime.log(ctx, "openssl conf: " + sslConf.getAbsolutePath());
+
             List<String> cmd = new ArrayList<>();
             cmd.add(Runtime.nodeBin(ctx).getAbsolutePath());
             cmd.add("--expose-internals");
@@ -164,6 +177,8 @@ public class ServerService extends Service {
             env.put("LD_LIBRARY_PATH", rt.getAbsolutePath() + "/lib");
             env.put("LANG", "C.UTF-8");
             env.put("DSH_SHARE_DIR", new File(getFilesDir(), "share").getAbsolutePath());
+            env.put("DSH_PICKER_HOME", Environment.getExternalStorageDirectory().getAbsolutePath());
+            env.put("OPENSSL_CONF", sslConf.getAbsolutePath());
             pb.redirectErrorStream(true);
 
             Runtime.log(ctx, "spawn: " + cmd);
