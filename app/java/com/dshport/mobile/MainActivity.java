@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
@@ -31,9 +32,24 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileOutputStream;
+
+import android.graphics.Color;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 public class MainActivity extends Activity {
     private static final String BASE_URL = "http://127.0.0.1:3080/";
     private static final int REQ_FILE = 41;
+    private static final int REQ_STORAGE = 42;
 
     private WebView web;
     private LinearLayout overlay;
@@ -67,6 +83,10 @@ public class MainActivity extends Activity {
             } catch (Throwable ignored) { }
         }
 
+        handler.postDelayed(new Runnable() {
+            public void run() { ensureStorageAccess(); }
+        }, 1500);
+
         if (embedded) {
             Runtime.writeStatus(this, "BOOTING");
             startEngine();
@@ -77,6 +97,355 @@ public class MainActivity extends Activity {
             spinner.setVisibility(View.GONE);
             showBanner("直连模式：正在连接 " + BASE_URL + "（引擎需在外部运行）");
             web.loadUrl(BASE_URL);
+        }
+    }
+
+    /** 是否已能真正读写共享存储（功能探测，比权限查询可靠）。 */
+    private boolean sharedStorageReady() {
+        try {
+            File root = Environment.getExternalStorageDirectory();
+            if (root == null) return false;
+            File probe = new File(root, ".dsh_access_probe");
+            FileOutputStream o = new FileOutputStream(probe);
+            o.write(1);
+            o.close();
+            return probe.delete();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void ensureStorageAccess() {
+        if (sharedStorageReady()) {
+            Runtime.log(this, "storage: shared storage writable");
+            return;
+        }
+        Runtime.log(this, "storage: no shared-storage access yet");
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.storage_title)
+                .setMessage(R.string.storage_message)
+                .setPositiveButton(R.string.storage_grant, new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) { requestStorageAccess(); }
+                })
+                .setNegativeButton(R.string.storage_later, null)
+                .show();
+    }
+
+    private void requestStorageAccess() {
+        try {
+            requestPermissions(new String[] {
+                    "android.permission.WRITE_EXTERNAL_STORAGE",
+                    "android.permission.READ_EXTERNAL_STORAGE"
+            }, REQ_STORAGE);
+        } catch (Throwable t) {
+            Runtime.log(this, "request storage perms failed: " + t);
+            openAllFilesSettings();
+        }
+    }
+
+    private void openAllFilesSettings() {
+        if (Build.VERSION.SDK_INT < 30) return;
+        try {
+            startActivity(new Intent("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION",
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent("android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION"));
+            } catch (Throwable t2) {
+                Runtime.log(this, "cannot open all-files settings: " + t2);
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] granted) {
+        super.onRequestPermissionsResult(code, perms, granted);
+        if (code != REQ_STORAGE) return;
+        if (sharedStorageReady()) {
+            Runtime.log(this, "storage: granted — shared storage writable");
+            Toast.makeText(this, R.string.storage_ok, Toast.LENGTH_SHORT).show();
+        } else {
+            Runtime.log(this, "storage: still not writable, opening all-files settings");
+            openAllFilesSettings();
+        }
+    }
+
+    /* ================= 应用内「获取更新」 ================= */
+    private static final String UPDATE_REPO = "TaoQiYiYi/DeepSeek-Harness-Android";
+    private volatile boolean updateBusy;
+    private String pendingApkUrl;
+
+    private void handleShellCommand(String json) {
+        try {
+            JSONObject o = new JSONObject(json);
+            String cmd = o.optString("cmd", "");
+            if ("chrome".equals(cmd)) applyChrome(o.optString("bg", null));
+            else if ("check".equals(cmd)) startUpdateCheck();
+            else if ("install".equals(cmd)) startUpdateInstall(o.optString("url", null));
+            else if ("log".equals(cmd)) sendLogToPage();
+            else if ("copylog".equals(cmd)) copyLogToClipboard();
+        } catch (Throwable t) {
+            Runtime.log(this, "shell command failed: " + t);
+        }
+    }
+
+    private void sendLogToPage() {
+        new Thread(new Runnable() {
+            public void run() {
+                String net = "[网络自检·引擎] " + nodeNetworkTest() + "\n";
+                final String log = net + Runtime.tailLog(MainActivity.this, 40000);
+                callJs("window.__dshmLog && window.__dshmLog(" + JSONObject.quote(log) + ")");
+            }
+        }, "log-net").start();
+    }
+
+    /** 用运行时自带的 Node 直接请求官方 API，验证引擎侧网络（DNS/TLS/连通性）。 */
+    private String nodeNetworkTest() {
+        try {
+            File rt = Runtime.root(this);
+            File node = new File(rt, "bin/node");
+            if (!node.exists()) return "(运行时未解压，跳过)";
+            String script = "const t=Date.now();fetch('https://api.deepseek.com/',{signal:AbortSignal.timeout(15000)})"
+                    + ".then(r=>{console.log('\u6210\u529f HTTP '+r.status+' \u7528\u65f6'+(Date.now()-t)+'ms');process.exit(0)},"
+                    + "e=>{console.log('\u5931\u8d25 '+(e&&e.message||e)+(e&&e.cause?(' | '+(e.cause.code||e.cause.message||'')):''));process.exit(0)})";
+            ProcessBuilder pb = new ProcessBuilder(node.getAbsolutePath(), "-e", script);
+            pb.environment().put("HOME", Runtime.homeDir(this).getAbsolutePath());
+            pb.environment().put("PATH", rt.getAbsolutePath() + "/bin:/system/bin:/system/xbin");
+            pb.environment().put("LD_LIBRARY_PATH", rt.getAbsolutePath() + "/lib");
+            pb.environment().put("OPENSSL_CONF", new File(rt, "etc/tls/openssl.cnf").getAbsolutePath());
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream(), "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(line);
+            }
+            p.waitFor();
+            return sb.length() == 0 ? "(无输出)" : sb.toString();
+        } catch (Throwable t) {
+            return "\u5f02\u5e38: " + t;
+        }
+    }
+
+    private void copyLogToClipboard() {
+        try {
+            final String log = Runtime.tailLog(this, 40000);
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(ClipData.newPlainText("dsh-log", log));
+                runOnUiThread(new Runnable() {
+                    public void run() { Toast.makeText(MainActivity.this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show(); }
+                });
+            }
+        } catch (Throwable t) {
+            Runtime.log(this, "copy log failed: " + t);
+        }
+    }
+
+    /** 主题同步：把界面底色应用到状态栏 / 导航栏，并按亮度切换图标色。 */
+    private void applyChrome(String hex) {
+        if (hex == null || hex.isEmpty()) return;
+        try {
+            int c = Color.parseColor(hex);
+            int color = 0xFF000000 | (c & 0xFFFFFF);
+            getWindow().setStatusBarColor(color);
+            getWindow().setNavigationBarColor(color);
+            double lum = (0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)) / 255.0;
+            View dv = getWindow().getDecorView();
+            int flags = dv.getSystemUiVisibility();
+            int light = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            if (lum > 0.6) flags |= light;
+            else flags &= ~light;
+            dv.setSystemUiVisibility(flags);
+        } catch (Throwable t) {
+            Runtime.log(this, "chrome color failed: " + t);
+        }
+    }
+
+    private void startUpdateCheck() {
+        if (updateBusy) return;
+        updateBusy = true;
+        new Thread(new Runnable() {
+            public void run() {
+                String payload;
+                try {
+                    JSONObject rel = githubLatestRelease();
+                    String tag = rel.optString("tag_name", "");
+                    String latest = (tag.startsWith("v") || tag.startsWith("V")) ? tag.substring(1) : tag;
+                    String current = Runtime.APP_VERSION;
+                    JSONArray assets = rel.optJSONArray("assets");
+                    String apkUrl = null, apkName = null;
+                    long apkSize = 0;
+                    if (assets != null) {
+                        for (int i = 0; i < assets.length(); i++) {
+                            JSONObject a = assets.optJSONObject(i);
+                            if (a == null) continue;
+                            String nm = a.optString("name", "");
+                            if (!nm.toLowerCase().endsWith(".apk")) continue;
+                            boolean full = nm.toLowerCase().contains("full");
+                            if (apkUrl == null || full) {
+                                apkUrl = a.optString("browser_download_url", "");
+                                apkName = nm;
+                                apkSize = a.optLong("size", 0);
+                            }
+                            if (full) break;
+                        }
+                    }
+                    pendingApkUrl = apkUrl;
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("current", current);
+                    out.put("latest", latest);
+                    out.put("hasUpdate", compareVersions(latest, current) > 0);
+                    out.put("apkUrl", apkUrl == null ? "" : apkUrl);
+                    out.put("apkName", apkName == null ? "" : apkName);
+                    out.put("apkSize", apkSize);
+                    out.put("htmlUrl", rel.optString("html_url", ""));
+                    out.put("notes", rel.optString("body", ""));
+                    payload = out.toString();
+                } catch (Throwable t) {
+                    Runtime.log(MainActivity.this, "update check failed: " + t);
+                    payload = "{\"ok\":false,\"error\":" + JSONObject.quote(String.valueOf(t.getMessage() == null ? t : t.getMessage())) + "}";
+                }
+                updateBusy = false;
+                callJs("window.__dshUpdateResult && window.__dshUpdateResult(" + payload + ")");
+            }
+        }, "dsh-update-check").start();
+    }
+
+    private JSONObject githubLatestRelease() throws Exception {
+        URL url = new URL("https://api.github.com/repos/" + UPDATE_REPO + "/releases/latest");
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
+        c.setRequestProperty("Accept", "application/vnd.github+json");
+        c.setRequestProperty("User-Agent", "DSHPort-Android");
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(20000);
+        int code = c.getResponseCode();
+        if (code == 404) throw new IOException("仓库还没有发布 Release（或仓库不可见）");
+        if (code == 403) throw new IOException("GitHub 访问受限（HTTP 403），稍后再试");
+        if (code != 200) throw new IOException("GitHub 返回 HTTP " + code);
+        return new JSONObject(readStream(c.getInputStream()));
+    }
+
+    private void startUpdateInstall(final String apkUrl) {
+        final String url = (apkUrl == null || apkUrl.isEmpty()) ? pendingApkUrl : apkUrl;
+        if (url == null || url.isEmpty()) {
+            callJs("window.__dshUpdateState && window.__dshUpdateState('fail','没有可用的下载地址')");
+            return;
+        }
+        if (updateBusy) return;
+        updateBusy = true;
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    File dir = new File(getFilesDir(), "share");
+                    if (!dir.mkdirs() && !dir.isDirectory()) throw new IOException("无法创建下载目录");
+                    File out = new File(dir, "dshport-update.apk");
+                    HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                    c.setInstanceFollowRedirects(true);
+                    c.setRequestProperty("User-Agent", "DSHPort-Android");
+                    c.setConnectTimeout(15000);
+                    c.setReadTimeout(30000);
+                    int code = c.getResponseCode();
+                    if (code != 200) throw new IOException("下载失败 HTTP " + code);
+                    long total = c.getContentLength();
+                    InputStream in = c.getInputStream();
+                    FileOutputStream fo = new FileOutputStream(out);
+                    byte[] buf = new byte[65536];
+                    long done = 0;
+                    int lastPct = -1;
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        fo.write(buf, 0, n);
+                        done += n;
+                        if (total > 0) {
+                            int pct = (int) (done * 100 / total);
+                            if (pct != lastPct) {
+                                lastPct = pct;
+                                callJs("window.__dshUpdateProgress && window.__dshUpdateProgress(" + pct + ")");
+                            }
+                        }
+                    }
+                    fo.close();
+                    in.close();
+                    Runtime.log(MainActivity.this, "update downloaded: " + out.length() + " bytes");
+                    callJs("window.__dshUpdateProgress && window.__dshUpdateProgress(100)");
+                    installApk(out);
+                } catch (Throwable t) {
+                    Runtime.log(MainActivity.this, "update download failed: " + t);
+                    callJs("window.__dshUpdateState && window.__dshUpdateState('fail'," +
+                            JSONObject.quote(String.valueOf(t.getMessage() == null ? t : t.getMessage())) + ")");
+                }
+                updateBusy = false;
+            }
+        }, "dsh-update-download").start();
+    }
+
+    private void installApk(File apk) {
+        try {
+            Uri uri = Uri.parse("content://" + ShareProvider.AUTHORITY + "/" + Uri.encode(apk.getName()));
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri, "application/vnd.android.package-archive");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            callJs("window.__dshUpdateState && window.__dshUpdateState('done','下载完成，请在系统安装器中确认安装')");
+        } catch (Throwable t) {
+            Runtime.log(this, "install intent failed: " + t);
+            callJs("window.__dshUpdateState && window.__dshUpdateState('fail'," +
+                    JSONObject.quote("无法调起系统安装器：" + t) + ")");
+        }
+    }
+
+    private void callJs(final String code) {
+        runOnUiThread(new Runnable() {
+            public void run() {
+                try { web.evaluateJavascript(code, null); } catch (Throwable ignored) { }
+            }
+        });
+    }
+
+    private static String readStream(InputStream in) throws IOException {
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+        in.close();
+        return new String(bo.toByteArray(), "UTF-8");
+    }
+
+    private static int compareVersions(String a, String b) {
+        int[] x = verParts(a), y = verParts(b);
+        int len = Math.max(x.length, y.length);
+        for (int i = 0; i < len; i++) {
+            int xi = i < x.length ? x[i] : 0;
+            int yi = i < y.length ? y[i] : 0;
+            if (xi != yi) return xi > yi ? 1 : -1;
+        }
+        return 0;
+    }
+
+    private static int[] verParts(String v) {
+        String s = v == null ? "" : v.trim();
+        if (s.startsWith("v") || s.startsWith("V")) s = s.substring(1);
+        String[] seg = s.split("[^0-9]+");
+        int cnt = 0;
+        for (String t : seg) if (t.length() > 0) cnt++;
+        int[] out = new int[cnt];
+        int k = 0;
+        for (String t : seg) {
+            if (t.length() == 0) continue;
+            try { out[k++] = Integer.parseInt(t); } catch (Throwable e) { out[k++] = 0; }
+        }
+        return out;
+    }
+
+    private int buildCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Throwable t) {
+            return -1;
         }
     }
 
@@ -171,13 +540,19 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView v, String url) {
                 injectMobileJs();
+                injectCriticalCss();
                 Runtime.log(MainActivity.this, "page finished: " + url.replaceAll("token=[^&]+", "token=***"));
             }
         });
         web.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage m) {
-                Runtime.log(MainActivity.this, "js: " + m.message());
+                String msg = m == null ? null : m.message();
+                if (msg != null && msg.startsWith("__DSHM__")) {
+                    handleShellCommand(msg.substring(8));
+                    return true;
+                }
+                Runtime.log(MainActivity.this, "js: " + msg);
                 return true;
             }
             @Override
@@ -226,8 +601,25 @@ public class MainActivity extends Activity {
         setContentView(root);
     }
 
+    /** 由 App 直接注入的关键布局 CSS —— 不依赖 mobile.js 是否运行成功。 */
+    private void injectCriticalCss() {
+        try {
+            String css = Runtime.readAll(getAssets().open("mobile-critical.css"));
+            String js = "(function(){try{if(document.getElementById('dshm-crit'))return;"
+                    + "var s=document.createElement('style');s.id='dshm-crit';"
+                    + "s.textContent=" + JSONObject.quote(css) + ";"
+                    + "(document.head||document.documentElement).appendChild(s);}catch(e){}})();";
+            web.evaluateJavascript(js, null);
+        } catch (Throwable t) {
+            Runtime.log(this, "critical css inject failed: " + t);
+        }
+    }
+
     private void injectMobileJs() {
         try {
+            web.evaluateJavascript("window.__dshAppVersion='" + Runtime.APP_VERSION + "';"
+                    + "window.__dshAppBuild=" + buildCode() + ";"
+                    + "window.__dshCoreVersion='" + Runtime.coreVersion(this) + "';", null);
             final String js = Runtime.readAll(getAssets().open("mobile.js"));
             web.evaluateJavascript(js, null);
         } catch (Throwable t) {
@@ -305,11 +697,35 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (web != null && web.canGoBack()) {
-            web.goBack();
-        } else {
-            super.onBackPressed();
+        // 逐级返回：先让页面关掉面板/弹窗，再回退网页历史，最后才退出应用。
+        if (web == null || status == null) {
+            backFallback(false);
+            return;
         }
+        try {
+            web.evaluateJavascript(
+                    "(function(){try{return window.__dshmBack?window.__dshmBack():false}catch(e){return false}})()",
+                    new ValueCallback<String>() {
+                        @Override public void onReceiveValue(String value) {
+                            backFallback(value != null && value.contains("true"));
+                        }
+                    });
+        } catch (Throwable t) {
+            backFallback(false);
+        }
+    }
+
+    private void backFallback(boolean pageHandled) {
+        if (pageHandled) return;
+        try {
+            if (web != null && web.canGoBack()) {
+                web.goBack();
+                return;
+            }
+        } catch (Throwable ignored) { }
+        try {
+            super.onBackPressed();
+        } catch (Throwable ignored) { }
     }
 
     @Override

@@ -9,4 +9,9 @@
     <string name="status_error">引擎启动失败</string>
     <string name="retry">重试</string>
     <string name="view_log">查看日志</string>
+    <string name="storage_title">允许访问手机文件</string>
+    <string name="storage_message">授予存储权限后，即可把手机里的目录（如 Documents、Download）选为 DSH 工作区；否则只能使用应用私有目录。</string>
+    <string name="storage_grant">去授权</string>
+    <string name="storage_later">稍后</string>
+    <string name="storage_ok">存储权限已就绪</string>
 </resources>
