@@ -18,8 +18,8 @@ import java.util.zip.ZipInputStream;
 
 /** Paths, logging, status file and first-run runtime extraction. */
 final class Runtime {
-    static final String APP_VERSION = "0.2.0";
-    static final String RUNTIME_VERSION = "0.2.0";
+    static final String APP_VERSION = "0.2.2-rc2";
+    static final String RUNTIME_VERSION = "0.2.2-rc1-r8";
 
     private Runtime() {}
 
@@ -116,6 +116,17 @@ final class Runtime {
         }
         try { return readAll(new FileInputStream(f)).trim(); }
         catch (Throwable t) { return "(unreadable)"; }
+    }
+
+    /** 已解压运行时的 DSH 核心版本；未解压时返回空串。 */
+    static String coreVersion(Context c) {
+        try {
+            File pkg = new File(root(c), "node_modules/@deepseek-ai/dsh/package.json");
+            String s = readAll(new FileInputStream(pkg));
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"version\"\\s*:\\s*\"([^\"]+)\"").matcher(s);
+            if (m.find()) return m.group(1);
+        } catch (Throwable ignored) { }
+        return "";
     }
 
     static String readAll(InputStream in) throws IOException {

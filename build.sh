@@ -67,6 +67,11 @@ if [ -f "$P/app/assets/mobile.js" ]; then
   cp "$P/app/assets/mobile.js" assets/mobile.js
   zip -q -X app-unsigned.apk assets/mobile.js
 fi
+if [ -f "$P/app/assets/mobile-critical.css" ]; then
+  mkdir -p assets
+  cp "$P/app/assets/mobile-critical.css" assets/mobile-critical.css
+  zip -q -X app-unsigned.apk assets/mobile-critical.css
+fi
 ls -la app-unsigned.apk
 
 echo "== 6/6 sign =="
